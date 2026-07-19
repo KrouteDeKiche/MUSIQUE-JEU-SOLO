@@ -9,6 +9,11 @@ import warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3' 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
+# --- CONFIGURATION DU CACHE ---
+# On force TensorFlow à sauvegarder le modèle dans un dossier local (cerveau_ia) juste à côté du script
+dossier_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cerveau_ia")
+os.environ["TFHUB_CACHE_DIR"] = dossier_local
+
 # --- LE CHRONOMÈTRE EN ARRIÈRE-PLAN ---
 chargement_en_cours = True
 debut_chrono = time.time()
@@ -21,6 +26,7 @@ def afficher_chrono():
         time.sleep(0.1)
 
 fil_chrono = threading.Thread(target=afficher_chrono)
+fil_chrono.daemon = True  # <- SÉCURITÉ ANTI-ZOMBIE : Le chrono meurt si le programme plante
 fil_chrono.start()
 # --------------------------------------
 
@@ -28,16 +34,23 @@ fil_chrono.start()
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
 warnings.filterwarnings("ignore")
 
-# --- IMPORTS LOURDS (C'est ça qui prend 13 secondes) ---
-import tensorflow as tf
-import tensorflow_hub as hub
-import numpy as np
-import sounddevice as sd
-import keyboard
-import csv
-from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume 
-from comtypes import GUID, IUnknown, COMMETHOD, POINTER
-from ctypes import c_float, HRESULT
+# --- IMPORTS LOURDS SÉCURISÉS ---
+try:
+    import tensorflow as tf
+    import tensorflow_hub as hub
+    import numpy as np
+    import sounddevice as sd
+    import keyboard
+    import csv
+    from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume 
+    from comtypes import GUID, IUnknown, COMMETHOD, POINTER
+    from ctypes import c_float, HRESULT
+except ImportError as e:
+    chargement_en_cours = False
+    print(f"\n\n❌ Oups ! Il manque un module pour faire tourner le programme : {e}")
+    print("👉 Tape cette commande dans ton terminal pour tout installer :")
+    print("pip install tensorflow tensorflow-hub numpy sounddevice keyboard pycaw comtypes\n")
+    sys.exit(1)
 
 # --- LE STÉTHOSCOPE POUR CHROME ---
 class IAudioMeterInformation(IUnknown):
@@ -47,20 +60,28 @@ class IAudioMeterInformation(IUnknown):
     ]
 
 # --- CONFIGURATION ---
-DEVICE_ID = 27  
 FS_IA = 16000   
 DURATION = 0.975 
 PATIENCE_TIME = 7.5 
 
 FADE_OUT_TIME = 1.5  
 FADE_IN_TIME = 5.0   
+
+# Fichier de sauvegarde pour le périphérique audio
+fichier_config_audio = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config_audio.txt")
 # ---------------------
 
-# --- CHARGEMENT ABSOLU (0% Internet, 100% Disque Dur) ---
-chemin_cerveau = r"D:\kuntz\Documents\Projet_code\Auto_spotify\cerveau_ia\9616fd04ec2360621642ef9455b84f4b668e219e"
+# --- CHARGEMENT DYNAMIQUE (Télécharge au 1er lancement, puis lit depuis le disque) ---
+chemin_cerveau = "https://tfhub.dev/google/yamnet/1"
 
-# On charge le modèle (C'est ça qui prend les 7 dernières secondes)
-model = hub.load(chemin_cerveau)
+# On charge le modèle
+try:
+    model = hub.load(chemin_cerveau)
+except Exception as e:
+    chargement_en_cours = False
+    print(f"\n\n❌ Impossible de télécharger ou charger le modèle IA : {e}")
+    print("Vérifie ta connexion internet pour le premier lancement !")
+    sys.exit(1)
 
 # On extrait le vocabulaire de l'IA
 class_map_path = model.class_map_path().numpy().decode('utf-8')
@@ -130,8 +151,52 @@ def is_it_music(audio_data):
     return "Music" in top_prediction, top_3_classes, top_3_scores
 
 def main():
+    DEVICE_ID = None
+    
+    # --- TENTATIVE DE LECTURE DE LA SAUVEGARDE ---
+    if os.path.exists(fichier_config_audio):
+        try:
+            with open(fichier_config_audio, 'r') as f:
+                saved_id = int(f.read().strip())
+            # On vérifie que ce périphérique existe toujours et fonctionne
+            sd.query_devices(saved_id, 'input')
+            DEVICE_ID = saved_id
+            print(f"✅ Périphérique audio chargé depuis la sauvegarde (ID: {DEVICE_ID})")
+        except Exception:
+            print("⚠️ Le périphérique sauvegardé n'est plus valide ou introuvable. Nouvelle sélection requise.")
+            DEVICE_ID = None
+
+    # --- SÉLECTION DU PÉRIPHÉRIQUE INTERACTIVE (Si pas de sauvegarde ou erreur) ---
+    if DEVICE_ID is None:
+        print("🔍 SÉLECTION DU PÉRIPHÉRIQUE AUDIO")
+        print("Voici la liste des microphones et sorties virtuelles de ton PC :")
+        try:
+            devices = sd.query_devices()
+            for i, dev in enumerate(devices):
+                # On affiche uniquement ceux capables de capturer du son
+                if dev['max_input_channels'] > 0:
+                    print(f"   [{i}] {dev['name']}")
+            
+            while True:
+                try:
+                    choix = input("\n👉 Tape le numéro du périphérique à écouter (cherche 'Mixage Stéréo' ou 'Virtual Cable') : ")
+                    DEVICE_ID = int(choix)
+                    # On vérifie que le numéro est valide
+                    sd.query_devices(DEVICE_ID, 'input')
+                    
+                    # On sauvegarde le choix pour la prochaine fois
+                    with open(fichier_config_audio, 'w') as f:
+                        f.write(str(DEVICE_ID))
+                        
+                    print("✅ Périphérique validé et sauvegardé pour tes prochains lancements !\n")
+                    break
+                except Exception:
+                    print("❌ Numéro invalide ou incompatible, réessaie.")
+        except Exception as e:
+            print(f"❌ Impossible de lister les périphériques : {e}")
+            return
+
     # --- RÉGLAGE INITIAL DU VOLUME ---
-    # On va chercher le volume actuel de Chrome dès le lancement
     initial_ctrl = get_spotify_volume_control()
     if initial_ctrl:
         normal_spotify_volume = initial_ctrl.GetMasterVolume()
@@ -140,8 +205,6 @@ def main():
         normal_spotify_volume = 1.0
         print("🔈 Chrome non détecté au lancement, volume par défaut réglé à 100%.")
     # ----------------------------------
-
-    print("🦀 L'IA est prête ! (Temps total de chauffe : ...)")
     
     is_paused = False           
     script_paused_chrome = False 
@@ -150,8 +213,9 @@ def main():
     try:
         device_info = sd.query_devices(DEVICE_ID, 'input')
         native_fs = int(device_info['default_samplerate'])
+        print(f"🎤 Écoute en cours sur : {device_info['name']}")
     except Exception as e:
-        print(f"❌ Erreur critique : {e}")
+        print(f"❌ Erreur critique avec le périphérique audio : {e}")
         return
 
     try:
@@ -164,7 +228,19 @@ def main():
                 step = max(1, int(native_fs / FS_IA))
                 audio_data = audio_mono[::step]
 
-                is_music, top_3_classes, top_3_scores = is_it_music(audio_data)
+                # --- NOUVELLE SÉCURITÉ ANTI-AVC POUR L'IA ---
+                # 1. On nettoie les bugs du câble virtuel (remplace les NaN par des zéros)
+                audio_data = np.nan_to_num(audio_data)
+                
+                # 2. Si le câble n'envoie aucun son, on évite de solliciter l'IA
+                if np.max(np.abs(audio_data)) < 1e-4:
+                    is_music = False
+                    top_3_classes = ["Silence Absolu", "Rien", "Rien"]
+                    top_3_scores = [1.0, 0.0, 0.0]
+                else:
+                    is_music, top_3_classes, top_3_scores = is_it_music(audio_data)
+                # ---------------------------------------------
+
                 print(f"🎧 J'entends : 1.{top_3_classes[0]} ({int(top_3_scores[0]*100)}%) | 2.{top_3_classes[1]} ({int(top_3_scores[1]*100)}%)")
 
                 if is_music:
